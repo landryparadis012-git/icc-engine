@@ -80,7 +80,6 @@ def rsi(closes, n=14):
 
 # ---------------- data ----------------
 def fetch_chart(code, interval, rng, tries=3):
-    url = f"https://query1.freeending/"  # placeholder removed below
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}?interval={interval}&range={rng}"
     err = None
     for i in range(tries):
