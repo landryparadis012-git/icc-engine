@@ -11,7 +11,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,7 +29,25 @@ jobs:
           git add data/
           if git diff --cached --quiet; then
             echo "no memory changes"
-          else
-            git commit -m "memory update [skip ci]"
-            git push
+            exit 0
           fi
+          git commit -m "memory update [skip ci]"
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash origin main; then
+              if git push; then
+                echo "memory pushed"
+                exit 0
+              fi
+            else
+              echo "rebase conflict — newest run's memory wins"
+              git rebase --abort 2>/dev/null || true
+              git fetch origin main
+              git reset --soft origin/main
+              git add data/
+              git commit -m "memory update [skip ci]" || true
+            fi
+            echo "attempt $attempt failed — retrying"
+            sleep $((attempt * 10))
+          done
+          echo "could not push this run; next run carries the memory forward"
+          exit 1
