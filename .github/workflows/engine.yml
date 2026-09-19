@@ -1,0 +1,35 @@
+name: ICC Engine Scan
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: icc-engine
+  cancel-in-progress: false
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python engine/engine.py
+      - name: Commit memory
+        run: |
+          git config user.name "icc-engine-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "no memory changes"
+          else
+            git commit -m "memory update [skip ci]"
+            git push
+          fi
