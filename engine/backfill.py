@@ -1,39 +1,54 @@
-"""
-ICC Engine — Historical Backfill v1.1 (behavioural)
-Same as v1.0 backfill, PLUS full path tracking: for every setup the sim walks
-the whole 96-bar horizon recording peak R, max giveback after peak, bars to
-peak, early MFE — while the baseline result stays the conservative SL-first
-fixed 1.5R outcome. No lookahead; newest 96 bars excluded (unfinished paths).
-"""
-import time
-import engine as icc
-import config
-
-TTL_BARS = 96
-DEDUP_BARS = 8
-WARMUP = 60
-EARLY_BARS = 4
-
-
-def ema_series(vals, n):
-    k = 2.0 / (n + 1)
-    out, e = [], vals[0]
-    for v in vals:
-        e = v * k + e * (1 - k)
-        out.append(e)
-    return out
-
-
-def atr_series(bars, n=14):
-    trs = [bars[0][2] - bars[0][3]]
-    for i in range(1, len(bars)):
-        h, l, pc = bars[i][2], bars[i][3], bars[i - 1][4]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    out, s = [], 0.0
-    for i, tr in enumerate(trs):
-        s += tr
-        if i >= n:
-            s -= trs[i - n]
+name: ICC Engine Backfill
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: icc-engine
+  cancel-in-progress: false
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run backfill
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python engine/backfill.py
+      - name: Commit memory
+        run: |
+          git config user.name "icc-engine-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "no changes"
+            exit 0
+          fi
+          git commit -m "historical backfill [skip ci]"
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash origin main; then
+              if git push; then
+                echo "memory pushed"
+                exit 0
+              fi
+            else
+              echo "rebase conflict — newest run's memory wins"
+              git rebase --abort 2>/dev/null || true
+              git fetch origin main
+              git reset --soft origin/main
+              git add data/
+              git commit -m "historical backfill [skip ci]" || true
+            fi
+            echo "attempt $attempt failed — retrying"
+            sleep $((attempt * 10))
+          done
+          echo "could not push this run"
+          exit 1
         out.append(s / min(i + 1, n))
     return out
 
