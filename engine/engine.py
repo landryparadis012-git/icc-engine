@@ -48,7 +48,14 @@ def tg_get_updates(offset):
     tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     if not tok:
         return []
-    return http_json(config.TG_API.format(tok, "getUpdates") + f"?offset={offset}&timeout=0", headers=UA)
+    try:
+        resp = http_json(config.TG_API.format(tok, "getUpdates") + f"?offset={offset}&timeout=0", headers=UA)
+    except Exception as e:
+        print("[tg] getUpdates failed:", e)
+        return []
+    if isinstance(resp, dict):
+        return resp.get("result", []) or []
+    return []
 
 # ---------------- indicators ----------------
 def ema(vals, n):
@@ -332,6 +339,7 @@ def consider_candidates(con, state, analyses):
             return
     if decision == 3:
         rp = dict(cand)
+        rp["decision"] = 3
         rp["risk"] = abs(cand["entry"] - cand["sl"])
         rp["tp_r"] = cand["tp"]
         rp["opened_ts"] = int(time.time())
@@ -364,7 +372,7 @@ def manage_focus(state, analyses):
     htf_ok = s60["bull"] if dirn == 1 else s60["bear"]
     rng = max(an["h"] - an["l"], 1e-9)
     dl = (price - an["l"]) / rng * 100 if dirn == 1 else (an["h"] - price) / rng * 100
-    disp_now = min(5.0, abs(an["close"] - an["o"]) / max(s15["atr"], 1e-9))
+    disp_now = min(5.0, abs(price - an["o"]) / max(s15["atr"], 1e-9))
     mom = (30 if (s15["bull"] if dirn == 1 else s15["bear"]) else 0) + (30 if htf_ok else 0) \
         + dl / 100 * 20 + min(20.0, disp_now / 1.5 * 20)
     f["momentum"] = mom
@@ -492,13 +500,9 @@ def handle_command(con, state, txt):
                 f"memory rows: managed+raw")
 
 def process_updates(con, state):
-    try:
-        ups = tg_get_updates(state.get("tg_offset", 0) + 1)
-    except Exception as e:
-        print("[tg] getUpdates failed:", e)
-        return
-    for u in ups or []:
-        state["tg_offset"] = max(state.get("tg_offset", 0), u["update_id"])
+    ups = tg_get_updates(state.get("tg_offset", 0) + 1)
+    for u in ups:
+        state["tg_offset"] = max(state.get("tg_offset", 0), u.get("update_id", 0))
         if "callback_query" in u:
             cq = u["callback_query"]
             try:
@@ -530,7 +534,7 @@ def resolve_replays(con, state, analyses):
         if done is None:
             keep.append(rp)
             continue
-        remember(con, rp, rp["decision"], "raw", done, max(r, 0.0), min(r, 0.0), rp["opened_ts"])
+        remember(con, rp, rp.get("decision", 3), "raw", done, max(r, 0.0), min(r, 0.0), rp["opened_ts"])
         print(f"[replay] {rp['symbol']} resolved {done:+.2f}R (raw)")
     state["replays"] = keep
 
