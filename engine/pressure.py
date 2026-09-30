@@ -1,14 +1,14 @@
 """
-ICC Pressure Engine — V3 port (H4 slot pressure zones)
+ICC Pressure Engine — V3 port (H4 slot pressure zones) + UNIFIED CARDS
 Runs after the main engine scan. Detects slot-wick pressure zones on all
-symbols, fires TAKE cards (A+ / MOMENTUM / RETEST lanes), and simulates
-every blocked WATCH zone to its outcome — building permanent evidence.
-Manual execution unchanged: log trades with /taken on the main engine.
+symbols, fires ONE combined card per signal: old-engine pending block first,
+pressure setup second, with the SAME take/skip buttons and management flow.
+Every blocked WATCH zone is simulated to its outcome — permanent evidence.
 """
 import os, json, time, math, sqlite3
 from datetime import datetime, timezone
 import config
-import engine   # reuses fetch_chart, telegram, http (safe: main() not run on import)
+import engine   # reuses fetch_chart, telegram, state helpers
 
 DATA_DIR = "data"
 DB_PATH = os.path.join(DATA_DIR, "memory.db")
@@ -18,7 +18,7 @@ PV = "v3-h4p-1"          # pressure config version — isolates this memory
 MIN_STRENGTH = 6.5
 APLUS_LANE   = True
 APLUS_MIN    = 6.5
-SWEEP_MIN    = 6.5       # momentum lane min strength
+SWEEP_MIN    = 6.5
 USE_BIAS     = True
 GRACE_HRS    = 4
 EXPIRY_SLOTS = 3
@@ -30,17 +30,16 @@ WICK_10      = 45.0
 TP_WEAK, TP_STRONG = 0.8, 1.4
 SL_BUFFER, MIN_STOP = 0.15, 0.3
 SESSION_WINDOWS = {"BTC": None}          # default (7,20) UTC; BTC trades all day
-BAR_MAX_AGE  = 2 * 3600                  # skip symbol if feed frozen
+BAR_MAX_AGE  = 2 * 3600
 
 # ---------------- slots ----------------
 def slot_of(ts):
     h = datetime.fromtimestamp(ts, timezone.utc).hour
     if h < 3:  return 0
-    if h < 4:  return -1                      # technical break
+    if h < 4:  return -1
     return min(5, 1 + (h - 4) // 4)
 
 def build_slots(h1):
-    """group H1 bars into UTC slots -> list of dicts, oldest first"""
     slots = []
     cur = None
     for t, o, h, l, c in h1:
@@ -82,7 +81,6 @@ def zlema_series(closes, n=34):
 
 def vidya_trend(bars, cmo_len=20, ln=10, atr_len=200, mult=1.8):
     closes = [b[4] for b in bars]
-    vols = [b[4] for b in bars]  # placeholder, replaced below
     vols = [(b[2] + b[3] + 2 * b[4]) / 4 for b in bars]  # proxy vol (Yahoo H1 volume unreliable)
     vid = closes[0]; trend = 0; out = []
     trs = [max(bars[i][2] - bars[i][3], abs(bars[i][2] - bars[i - 1][4]), abs(bars[i][3] - bars[i - 1][4]))
@@ -101,7 +99,6 @@ def vidya_trend(bars, cmo_len=20, ln=10, atr_len=200, mult=1.8):
     return out, vid
 
 def h1_votes(h1):
-    """votes on the last COMPLETED H1 bar (we drop the forming bar upstream)"""
     closes = [b[4] for b in h1]
     tp = two_pole(closes); zl = zlema_series(closes); vt, _ = vidya_trend(h1)
     i = len(closes) - 1
@@ -143,18 +140,67 @@ def save_pstate(con, st):
     con.execute("INSERT INTO kv(k,v) VALUES('pstate',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                 (json.dumps(st),))
 
+# ---------------- unified card ----------------
+def pending_block(p):
+    """render the OLD engine's pending setup (if any) as the first block"""
+    if not p:
+        return None
+    name = config.SYMBOLS[p["symbol"]]["name"]
+    d = "BUY" if p["direction"] == 1 else "SELL"
+    tier = p.get("tier", "TAKE")
+    risk = abs(p["entry"] - p["sl"])
+    tp_px = p["entry"] + (1 if p["direction"] == 1 else -1) * risk * p.get("tp", 1.5)
+    return (f"<b>1️⃣ ICC ENGINE — {tier} · {name} {d}</b>\n"
+            f"Entry {p['entry']:.2f} | SL {p['sl']:.2f} | TP {tp_px:.2f}\n"
+            f"Q {p.get('quality', 0):.0f} | MOM {p.get('momentum', 0):.0f}")
+
+def pressure_block(lane, name, dtx, zone, f):
+    rr = abs(f["tp"] - f["entry"]) / f["risk"]
+    icon = "🌟" if lane == "A+" else "⚡" if lane == "MOMENTUM" else "🟢"
+    return (f"<b>2️⃣ {icon} PRESSURE {lane} — {name} {dtx}</b>\n"
+            f"Score {zone['strength']:.1f}/10 | {'sweep' if zone['sweep'] else 'zone'}\n"
+            f"Entry {f['entry']:.2f} | SL {f['sl']:.2f} | TP {f['tp']:.2f}\n"
+            f"R:R {rr:.1f}")
+
+def send_unified(con, lane, sym, d, zone, f):
+    """one card: old engine pending first, pressure setup second, same buttons"""
+    name = config.SYMBOLS[sym]["name"]
+    dtx = "BUY" if d == 1 else "SELL"
+    state = engine.load_state(con)
+    blocks = []
+    pb = pending_block(state.get("pending"))
+    if pb:
+        blocks.append(pb)
+    else:
+        blocks.append("<i>1️⃣ ICC ENGINE — no setup this scan</i>")
+    blocks.append(pressure_block(lane, name, dtx, zone, f))
+    txt = "═══ SETUP CARD ═══\n" + "\n\n".join(blocks) + \
+          "\n\n⚠️ Taking the pressure setup REPLACES the old-engine pending (last card wins)."
+    # promote the pressure setup into the old engine's pending slot → same buttons, same management
+    state["pending"] = {"symbol": sym, "tf": "H4-slot", "direction": d,
+                        "tier": f"PRESSURE-{lane}", "entry": f["entry"], "sl": f["sl"],
+                        "tp": abs(f["tp"] - f["entry"]) / f["risk"],
+                        "feats": {"disp": zone["strength"] / 2, "cont": 1 if zone["sweep"] else 0,
+                                  "depth": min(5.0, zone["strength"]), "sweep": 1 if zone["sweep"] else 0,
+                                  "vol": zone.get("volr", 50) or 50},
+                        "quality": zone["strength"] * 10, "momentum": 60, "conf": 3,
+                        "regime": 0, "session": engine.session_tag(int(time.time())), "behav": {}}
+    engine.save_state(con, state)
+    engine.tg_send(txt, [[{"text": "✅ TAKEN (TAKE)", "callback_data": "T|take"},
+                          {"text": "⚠️ TAKEN (RISKY)", "callback_data": "T|risky"}],
+                         [{"text": "✖ NOT TAKEN", "callback_data": "T|no"}]])
+
 # ---------------- symbol scan ----------------
 def scan_symbol(con, sym, st):
     cfg = config.SYMBOLS[sym]
     h1 = engine.fetch_chart(cfg["yahoo"], "60m", "2mo")
     if len(h1) < 120: return
-    if time.time() - h1[-1][0] > BAR_MAX_AGE: return          # frozen feed
-    h1 = h1[:-1]                                             # drop forming bar
+    if time.time() - h1[-1][0] > BAR_MAX_AGE: return
+    h1 = h1[:-1]
     slots = build_slots(h1)
     if len(slots) < 22: return
     ss = st.setdefault(sym, {"zones": [], "virtual": [], "vol_open": [], "vol_h4": [],
                              "atr_hist": [], "last_bar": 0, "last_slot_key": None})
-    # pools
     for s in slots[:-1]:
         rng = s["h"] - s["l"]
         if s["key"][1] == 0:
@@ -163,13 +209,13 @@ def scan_symbol(con, sym, st):
             pool = ss["vol_h4"]
             ss["atr_hist"].append(rng)
             del ss["atr_hist"][:-14]
-        if rng > 0 and (not pool or pool[-1][0] != s["key"][0].isoformat() + str(s["key"][1])):
-            pool.append((s["key"][0].isoformat() + str(s["key"][1]), rng))
+        tag = s["key"][0].isoformat() + str(s["key"][1])
+        if rng > 0 and (not pool or pool[-1][0] != tag):
+            pool.append((tag, rng))
             del pool[:-90]
     slot_atr = sum(ss["atr_hist"]) / len(ss["atr_hist"]) if ss["atr_hist"] else None
     if not slot_atr: return
 
-    # zone source = last completed slot
     prev = slots[-2]; cur = slots[-1]
     skey = str(prev["key"])
     if ss["last_slot_key"] != skey:
@@ -179,15 +225,13 @@ def scan_symbol(con, sym, st):
             body_top, body_bot = max(prev["o"], prev["c"]), min(prev["o"], prev["c"])
             up_pct = min(max(prev["h"] - body_top, 0) / rng, 1)
             lo_pct = min(max(body_bot - prev["l"], 0) / rng, 1)
-            # prior slot extremes for sweep/structure
             i2 = [i for i, s in enumerate(slots) if s["key"] == prev["key"]][0]
             s1 = slots[i2 - 1] if i2 >= 1 else None
             s2 = slots[i2 - 2] if i2 >= 2 else None
-            bull_sweep = s1 and prev["l"] < s1["l"] and prev["c"] > s1["l"]
-            bear_sweep = s1 and prev["h"] > s1["h"] and prev["c"] < s1["h"]
-            bull_struct = s2 and prev["c"] > s2["h"]
-            bear_struct = s2 and prev["c"] < s2["l"]
-            # FVG displacement
+            bull_sweep = bool(s1 and prev["l"] < s1["l"] and prev["c"] > s1["l"])
+            bear_sweep = bool(s1 and prev["h"] > s1["h"] and prev["c"] < s1["h"])
+            bull_struct = bool(s2 and prev["c"] > s2["h"])
+            bear_struct = bool(s2 and prev["c"] < s2["l"])
             fvg_ok = fvg_str = 0.0; fvg_dir = 0
             if s2 and slot_atr > 0:
                 if prev["l"] > s2["h"] and prev["c"] > prev["o"] and abs(prev["c"] - prev["o"]) / rng >= .55:
@@ -199,7 +243,6 @@ def scan_symbol(con, sym, st):
                     r = (s2["l"] - prev["h"]) / slot_atr
                     fvg_str = 8 if r >= 1.5 else 6 if r >= 1 else 4.5 if r >= .75 else 3 if r >= .5 else 1.5
             volr = percentile([p[1] for p in (ss["vol_open"] if prev["key"][1] == 0 else ss["vol_h4"])], rng)
-            # bias
             h4closes = [s["c"] for s in slots[:-1]]
             e50 = ema_series(h4closes, 50)[-1]
             price = h1[-1][4]
@@ -207,7 +250,6 @@ def scan_symbol(con, sym, st):
             now = int(time.time())
             expiry = now + EXPIRY_SLOTS * 4 * 3600
             zs = ss["zones"]
-            # bearish zone (upper wick)
             if up_pct >= WICK_PCT / 100 and body_top > prev["l"]:
                 ws = wick_str(up_pct)
                 rej = min(10, (((up_pct - WICK_PCT/100) / max(WICK_10/100 - WICK_PCT/100, .01)) * .45 +
@@ -215,13 +257,12 @@ def scan_symbol(con, sym, st):
                                (abs(prev["c"] - prev["o"]) / rng) * .15) * 10)
                 comp = sig_strength(ws, rej, bear_sweep, bear_struct, fvg_ok and fvg_dir == -1, fvg_str, volr)
                 aplus = APLUS_LANE and bear_sweep and bear_struct and (fvg_ok and fvg_dir == -1)
-                ok = comp >= MIN_STRENGTH and (bear_sweep) and (bear_struct) and (not USE_BIAS or bias_dn)
+                ok = comp >= MIN_STRENGTH and bear_sweep and bear_struct and (not USE_BIAS or bias_dn)
                 ok = ok or (aplus and comp >= APLUS_MIN and (not USE_BIAS or bias_dn))
                 if ok and (not zs or zs[-1]["dirn"] != -1 or comp >= zs[-1]["strength"]):
                     zs.append({"dirn": -1, "top": prev["h"], "bot": body_top, "strength": comp,
                                "atr": slot_atr, "expiry": expiry, "touched": False, "touch_ts": None,
-                               "sweep": bool(bear_sweep), "aplus": bool(aplus), "sent": False})
-            # bullish zone (lower wick)
+                               "sweep": bear_sweep, "aplus": bool(aplus), "sent": False, "volr": volr})
             if lo_pct >= WICK_PCT / 100 and body_bot < prev["h"]:
                 ws = wick_str(lo_pct)
                 rej = min(10, (((lo_pct - WICK_PCT/100) / max(WICK_10/100 - WICK_PCT/100, .01)) * .45 +
@@ -234,19 +275,17 @@ def scan_symbol(con, sym, st):
                 if ok and (not zs or zs[-1]["dirn"] != 1 or comp >= zs[-1]["strength"]):
                     zs.append({"dirn": 1, "top": body_bot, "bot": prev["l"], "strength": comp,
                                "atr": slot_atr, "expiry": expiry, "touched": False, "touch_ts": None,
-                               "sweep": bool(bull_sweep), "aplus": bool(aplus), "sent": False})
+                               "sweep": bull_sweep, "aplus": bool(aplus), "sent": False, "volr": volr})
             del zs[:-4]
 
-    # ---- zone lifecycle + entries on new H1 bars ----
     bull_v, bear_v = h1_votes(h1)
-    struct_t = {}
     s1, s2 = slots[-2], slots[-3] if len(slots) >= 3 else None
     lastbar_ts = ss["last_bar"]
     new_bars = [b for b in h1 if b[0] > lastbar_ts]
     if not new_bars: return
     ss["last_bar"] = h1[-1][0]
 
-    def fire(zone, bar, lane):
+    def fire(zone, bar):
         d = zone["dirn"]
         entry = bar[4]
         if d == 1:
@@ -268,13 +307,6 @@ def scan_symbol(con, sym, st):
         if tp is None or abs(tp - entry) / risk < MIN_RR: tp = atr_tp
         if abs(tp - entry) / risk < MIN_RR: return None
         return {"entry": entry, "sl": sl, "tp": tp, "risk": risk}
-
-    def block_reason(zone, votes, session_ok, bias_ok):
-        if not session_ok: return "NO-SESSION"
-        if not bias_ok:    return "COUNTER-TREND"
-        if zone["strength"] < MIN_STRENGTH and not zone["aplus"]: return "LOW-SCORE"
-        if votes < 1: return "NO-CONFIRM"
-        return None
 
     win = SESSION_WINDOWS.get("BTC" if "BTC" in sym else sym, (7, 20))
     hour_now = datetime.fromtimestamp(h1[-1][0], timezone.utc).hour
@@ -316,30 +348,25 @@ def scan_symbol(con, sym, st):
             if not zone.get("reason"): zone["reason"] = "COUNTER-TREND"
             continue
         if lane:
-            f = fire(zone, bar, lane)
+            f = fire(zone, bar)
             if f:
-                tier = "A" if lane in ("A+", "RETEST") else "A"
                 ss["virtual"].append({"sym": sym, "dirn": d, "tier": lane, "reason": None,
                                       "strength": zone["strength"], "entry": f["entry"], "sl": f["sl"],
                                       "tp": f["tp"], "risk": f["risk"], "partial": False,
                                       "opened_ts": int(time.time()), "mfe": 0.0, "be": False})
                 if not zone["sent"]:
-                    name = cfg["name"]; dtx = "BUY" if d == 1 else "SELL"
-                    tp_px = f["tp"]
-                    engine.tg_send(
-                        f"{'🌟' if lane=='A+' else '⚡' if lane=='MOMENTUM' else '🟢'} <b>{lane} — {name} {dtx}</b>\n"
-                        f"Score {zone['strength']:.1f}/10 | {'sweep' if zone['sweep'] else 'zone'}\n"
-                        f"Entry {f['entry']:.2f} | SL {f['sl']:.2f} | TP {tp_px:.2f}\n"
-                        f"R:R {abs(tp_px - f['entry']) / f['risk']:.1f} — log with /taken if you take it")
+                    send_unified(con, lane, sym, d, zone, f)
                     zone["sent"] = True
                 ss["zones"].remove(zone)
         else:
             if not zone.get("reason"):
-                r = block_reason(zone, votes, session_ok, bias_ok or not USE_BIAS)
+                r = "NO-SESSION" if not session_ok else \
+                    "COUNTER-TREND" if (not bias_ok and USE_BIAS) else \
+                    "LOW-SCORE" if (zone["strength"] < MIN_STRENGTH and not zone["aplus"]) else \
+                    "NO-CONFIRM" if votes < 1 else None
                 if r: zone["reason"] = r
 
 def resolve_virtual(con, st):
-    """simulate open virtual trades (TAKE evidence + WATCH outcomes) on fresh H1 bars"""
     keep = []
     for v in st.get("virtual", []):
         sym = v["sym"]; cfg = config.SYMBOLS[sym]
@@ -348,7 +375,6 @@ def resolve_virtual(con, st):
         done = None; d = v["dirn"]
         for t, o, h, l, c in bars:
             if "entry" not in v:
-                # WATCH that never fired: track from zone-touch price ≈ use first close
                 v["entry"] = c; v["risk"] = max(abs(c - v.get("sl_est", c * .995)), 1e-9)
                 v["tp"] = c + d * v["risk"] * 1.5; v["sl"] = c - d * v["risk"]
             risk = v["risk"]
