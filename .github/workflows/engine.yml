@@ -1,53 +1,42 @@
 name: ICC Engine Scan
+
 on:
   schedule:
     - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+
 permissions:
   contents: write
-concurrency:
-  group: icc-engine
-  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Run scan
+
+      - name: Main engine scan
+        run: python engine/engine.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python engine/engine.py
+
+      - name: Pressure scan (V3)
+        run: python engine/pressure.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
       - name: Commit memory
         run: |
-          git config user.name "icc-engine-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/
-          if git diff --cached --quiet; then
-            echo "no memory changes"
-            exit 0
-          fi
-          git commit -m "memory update [skip ci]"
-          for attempt in 1 2 3; do
-            if git pull --rebase --autostash origin main; then
-              if git push; then
-                echo "memory pushed"
-                exit 0
-              fi
-            else
-              echo "rebase conflict — newest run's memory wins"
-              git rebase --abort 2>/dev/null || true
-              git fetch origin main
-              git reset --soft origin/main
-              git add data/
-              git commit -m "memory update [skip ci]" || true
-            fi
-            echo "attempt $attempt failed — retrying"
-            sleep $((attempt * 10))
-          done
-          echo "could not push this run; next run carries the memory forward"
-          exit 1
+          git config user.name "icc-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/ || true
+          git diff --staged --quiet || git commit -m "memory update [skip ci]"
+          git push
