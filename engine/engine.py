@@ -639,6 +639,12 @@ def close_focus(con, state, r_override=None, sym=None):
         tg_send(f"🛑 {config.MAX_LOSS_STREAK} losses in a row — engine paused for {config.PAUSE_SCANS} scans.")
     state["daily_r"] = state.get("daily_r", 0.0) + r
     state["focus_list"] = [x for x in fl if x is not f]
+    # --- OpsHub: record the close in the hub outbox (guarded, never crashes) ---
+    try:
+        import hub_emit
+        hub_emit.emit_closed(con, f, r, path)
+    except Exception as _hub_err:
+        print(f"[hub] close emit failed: {_hub_err}")
     return f"logged {r:+.2f}R (managed, {f['tier']})"
 
 # ---------------- telegram updates ----------------
