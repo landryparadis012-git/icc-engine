@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+  # OpsHub triggers this repo with a repository_dispatch (type: icc.run).
+  repository_dispatch:
+    types: [icc.run, opshub.run]
 
 permissions:
   contents: write
