@@ -1,0 +1,43 @@
+name: Probe Yahoo symbols
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Probe
+        run: |
+          python - <<'EOF'
+          import json, time, urllib.request
+          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"}
+          for code in ["XAUUSD=X", "GC=F", "GBPUSD=X", "XAUUSD=X", "GLD"]:
+              for host in ["query1", "query2"]:
+                  url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{code}?interval=1d&range=1mo"
+                  try:
+                      req = urllib.request.Request(url, headers=UA)
+                      with urllib.request.urlopen(req, timeout=10) as r:
+                          j = json.loads(r.read())
+                      n = len(j["chart"]["result"][0].get("timestamp", []))
+                      print(f"PROBE {code} @{host}: OK {n} bars", flush=True)
+                      break
+                  except Exception as e:
+                      print(f"PROBE {code} @{host}: {e}", flush=True)
+                  time.sleep(2)
+              time.sleep(2)
+          # stooq check
+          for s in ["xauusd", "xauusd=x"]:
+              try:
+                  req = urllib.request.Request(f"https://stooq.com/q/d/l/?s={s}&i=d", headers=UA)
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      t = r.read().decode()
+                  print(f"PROBE stooq {s}: {'OK' if t.startswith('Date') else 'HTML/nodata'}", flush=True)
+              except Exception as e:
+                  print(f"PROBE stooq {s}: {e}", flush=True)
+          EOF
