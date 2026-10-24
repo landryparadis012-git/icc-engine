@@ -3,7 +3,7 @@
 CONFIG_VERSION = "v1.1.0-github"  # bumped: behavioural (path) memory
 
 SYMBOLS = {
-    "XAUUSD": {"yahoo": "XAUUSD=X", "name": "GOLD"},
+    "XAUUSD": {"yahoo": "GC=F", "name": "GOLD"},  # XAUUSD=X delisted by Yahoo (404); GC=F = gold futures
     "GBPUSD": {"yahoo": "GBPUSD=X", "name": "GBPUSD"},
     "US30":   {"yahoo": "^DJI",     "name": "DOW/US30"},
     "NAS100": {"yahoo": "NQ=F",     "name": "NAS100"},
