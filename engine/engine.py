@@ -11,6 +11,9 @@ import os, json, time, math, sqlite3
 import urllib.request
 from datetime import datetime, timezone
 import config
+import data_layer
+import indicators
+import regime
 
 DATA_DIR = "data"
 DB_PATH = os.path.join(DATA_DIR, "memory.db")
@@ -100,25 +103,13 @@ def mom_band(m):
 
 # ---------------- data ----------------
 def fetch_chart(code, interval, rng, tries=3):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}?interval={interval}&range={rng}"
-    err = None
-    for i in range(tries):
-        try:
-            j = http_json(url, headers=UA)
-            res = j["chart"]["result"][0]
-            q = res["indicators"]["quote"][0]
-            out = []
-            for k, t in enumerate(res["timestamp"]):
-                o, h, l, c = q["open"][k], q["high"][k], q["low"][k], q["close"][k]
-                if None in (o, h, l, c):
-                    continue
-                out.append((float(t), float(o), float(h), float(l), float(c)))
-            return out
-        except Exception as e:
-            err = e
-            time.sleep(1.5 * (i + 1))
-    print(f"[data] {code} {interval} failed: {err}")
-    return []
+    """OpenTerminal-style provider chain: Yahoo → Binance(crypto) → Stooq,
+    with TTL cache and per-provider health stats (see data_layer.py)."""
+    try:
+        return data_layer.fetch_candles(code, interval, rng, tries=tries)
+    except Exception as e:
+        print(f"[data] {code} {interval} failed on all providers: {e}")
+        return []
 
 def tf_state(bars):
     closes = [b[4] for b in bars]
@@ -278,6 +269,10 @@ def analyse_symbol(sym):
     if len(m15) < 60 or len(h1) < 30 or len(d1) < 20:
         return None
     s15, s60, sd = tf_state(m15), tf_state(h1), tf_state(d1)
+    closes15 = [b[4] for b in m15]
+    macd_l, macd_s, macd_h = indicators.macd(closes15)
+    bb_up, bb_mid, bb_low = indicators.bollinger(closes15)
+    vix_label, vix_off, vix_val = regime.current()
     a = max(s15["atr"], 1e-9)
     lows = [b[3] for b in m15]
     highs = [b[2] for b in m15]
@@ -312,6 +307,8 @@ def analyse_symbol(sym):
     trend_q = 20 if up else 0
     mtf_q = conf / 4 * 25
     quality = (trend_q + rsi_q + dl / 100 * 8 + bodyq / 100 * 7 + min(10.0, disp / 1.5 * 10) + 5.0 + liq + mtf_q) * 0.75 + mom * 0.25
+    bb_pos = (c - bb_low) / max(bb_up - bb_low, 1e-9) * 100 if bb_up > bb_low else 50.0
+    quality += 4.0 if (macd_h > 0) == (dirn == 1) else 0.0  # MACD confluence tiebreak
     sl = (swing_lo - a * config.SL_BUFFER_ATR) if dirn == 1 else (swing_hi + a * config.SL_BUFFER_ATR)
     cand = {"symbol": sym, "tf": "15m", "direction": dirn, "entry": c, "sl": sl, "tp": 1.5,
             "feats": {"disp": disp, "cont": 1.0 if up else 0.0, "depth": depth,
@@ -319,7 +316,10 @@ def analyse_symbol(sym):
                       "vol": 50.0},
             "quality": quality, "momentum": mom, "conf": conf, "mtf_ok": conf >= 3,
             "regime": 1 if (s60["bull"] or s60["bear"]) else 0,
-            "session": session_tag(m15[-1][0]), "price": c}
+            "session": session_tag(m15[-1][0]), "price": c,
+            "ind": {"macd": macd_l, "macd_h": macd_h, "bb_up": bb_up, "bb_mid": bb_mid,
+                    "bb_low": bb_low, "bb_pos": bb_pos, "vwap": indicators.vwap(m15)},
+            "vix": vix_val, "vix_label": vix_label, "vix_off": vix_off}
     an["candidate"] = cand
     return an
 
@@ -339,6 +339,7 @@ def send_setup_alert(state, cand, mem, decision, reason, edge, tag=""):
     name = config.SYMBOLS[cand["symbol"]]["name"]
     tp_px = cand["entry"] + (1 if cand["direction"] == 1 else -1) * abs(cand["entry"] - cand["sl"]) * cand["tp"]
     b = mem["behav"]
+    ind = cand.get("ind", {})
     hist_line = ""
     if b["n_raw"] >= config.BEHAV_SOFT_MATCHES and b["p50_peak"]:
         hist_line = (f"\nBehaviour (raw n={b['n_raw']}): typical peak {b['p50_peak']:.2f}R"
@@ -349,6 +350,7 @@ def send_setup_alert(state, cand, mem, decision, reason, edge, tag=""):
            f"Memory {mem['count']:.0f} | WR {mem['wr']:.0f}% | EXP {mem['exp']:+.2f}R | SIM {mem['sim']:.0f}%"
            + hist_line +
            f"\nQ {cand['quality']:.0f} | MOM {cand['momentum']:.0f} | MTF {cand['conf']}/4 | {cand['session']} reg={cand['regime']}\n"
+           f"VIX {cand.get('vix') or '?'} ({cand.get('vix_label', '?')}) | MACD {'▲' if ind.get('macd_h', 0) >= 0 else '▼'} | BB {ind.get('bb_pos', 50):.0f}%\n"
            f"Reason: {reason} | Edge {edge:.0f} | v{config.CONFIG_VERSION}")
     tg_send(txt, [[{"text": "✅ TAKEN (TAKE)", "callback_data": "T|take"},
                    {"text": "⚠️ TAKEN (RISKY)", "callback_data": "T|risky"}],
@@ -490,6 +492,10 @@ def consider_candidates(con, state, analyses):
     if time.time() < state.get("cooldowns", {}).get(key, 0):
         return
     decision, reason, edge = decide(cand, mem)
+    # VIX stress gate: rescue-tier entries are blocked when volatility says risk-off
+    if decision == 1 and cand.get("vix_off") and reason == "CURRENT RESCUE":
+        decision = 3
+        reason = f"RESCUE BLOCKED — VIX {cand.get('vix_label', '?')}"
     if focus_list:
         ap = a_plus_check(cand, mem, state)
         if ap == "DUP":
@@ -862,6 +868,9 @@ def main():
     save_state(con, state)
     con.commit()
     con.close()
+    st = data_layer.provider_stats()
+    if st:
+        print("[data] provider health:", json.dumps(st))
     print("[icc] scan complete")
 
 if __name__ == "__main__":
