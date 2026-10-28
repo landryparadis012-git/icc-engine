@@ -682,6 +682,52 @@ def start_focus_trade(state, p, tier=None):
             [[{"text": f"🏁 CLOSED — log {t['symbol']}", "callback_data": f"C|close:{t['symbol']}"}]])
 
 
+# ---------------- hub button-ack relay ----------------
+# Telegram button presses arrive at OpsHub's webhook, which stores them; the
+# engine claims them here at the start of every scan and applies them with the
+# same handle_ack() its own polling would have used.
+def hub_acks(op, payload=None):
+    """Signed POST to OpsHub /acks. Returns the parsed JSON or None. Never raises."""
+    url = os.environ.get("HUB_URL", "").rstrip("/")
+    secret = os.environ.get("HUB_WEBHOOK_SECRET", "")
+    if not url or not secret:
+        return None
+    try:
+        import hashlib
+        import hmac
+        body = json.dumps({"op": op, **(payload or {})}).encode("utf-8")
+        mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256)
+        req = urllib.request.Request(
+            url + "/acks", data=body, method="POST",
+            headers={"Content-Type": "application/json",
+                     "x-hub-signature-256": "sha256=" + mac.hexdigest()})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        print(f"[ack] hub {op} failed: {e}")
+        return None
+
+
+def pull_hub_acks(con, state):
+    """Consume button selections recorded by OpsHub (T|take, T|no, C|close...)."""
+    j = hub_acks("list")
+    acks = [a for a in ((j or {}).get("acks") or []) if a.get("data")]
+    if not acks:
+        return 0
+    done = []
+    for a in acks:
+        data = str(a["data"])
+        try:
+            handle_ack(con, state, data)
+            print(f"[ack] applied hub button: {data}")
+            done.append(int(a["id"]))
+        except Exception as e:
+            print(f"[ack] {data} failed: {e}")
+    if done:
+        hub_acks("consume", {"ids": done})
+    return len(done)
+
+
 def handle_ack(con, state, data):
     p = state.get("pending")
     if data in ("T|take", "T|risky"):
@@ -852,6 +898,7 @@ def main():
     n = con.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
     print(f"[icc] engine {config.CONFIG_VERSION} | memory rows: {n}")
     process_updates(con, state)
+    pull_hub_acks(con, state)
     analyses = {}
     for sym in config.SYMBOLS:
         an = analyse_symbol(sym)
