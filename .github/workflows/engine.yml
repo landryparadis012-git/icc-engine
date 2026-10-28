@@ -29,6 +29,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Button presses recorded by OpsHub (POST /acks) are applied at scan start
+          HUB_URL: ${{ secrets.HUB_URL }}
+          HUB_WEBHOOK_SECRET: ${{ secrets.HUB_WEBHOOK_SECRET }}
 
       - name: Pressure scan (V3)
         run: python engine/pressure.py
