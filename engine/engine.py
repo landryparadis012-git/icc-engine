@@ -14,6 +14,16 @@ import config
 import data_layer
 import indicators
 import regime
+import risk
+
+# Structured signal ledger (Phase 5D/E). One row per setup, updated in place as
+# it moves pending → opened → closed/dismissed/rejected, so the full decision
+# path survives restarts and can be audited without reading logs.
+SIGNALS_DDL = """CREATE TABLE IF NOT EXISTS signals(
+    signal_id TEXT PRIMARY KEY, symbol TEXT, direction INTEGER, tf TEXT,
+    entry REAL, sl REAL, tp_r REAL, tier TEXT, quality REAL, momentum REAL,
+    session TEXT, regime INTEGER, status TEXT, reason TEXT,
+    created_at INTEGER, updated_at INTEGER)"""
 
 DATA_DIR = "data"
 DB_PATH = os.path.join(DATA_DIR, "memory.db")
@@ -104,12 +114,24 @@ def mom_band(m):
 # ---------------- data ----------------
 def fetch_chart(code, interval, rng, tries=3):
     """OpenTerminal-style provider chain: Yahoo → Binance(crypto) → Stooq,
-    with TTL cache and per-provider health stats (see data_layer.py)."""
+    with TTL cache and per-provider health stats (see data_layer.py).
+
+    Every series passes the risk firewall's feed validation first: malformed,
+    duplicate, non-monotonic, future or stale bars fail CLOSED, so a bad feed
+    can never produce a setup (Phase 5C).
+    """
     try:
-        return data_layer.fetch_candles(code, interval, rng, tries=tries)
+        bars = data_layer.fetch_candles(code, interval, rng, tries=tries)
     except Exception as e:
         print(f"[data] {code} {interval} failed on all providers: {e}")
         return []
+    clean, fatal, dropped = risk.validate_bars(bars, interval)
+    if dropped:
+        print(f"[data] {code} {interval}: dropped {len(dropped)} bad bar(s) ({dropped[0]})")
+    if fatal:
+        print(f"[risk] {code} {interval} feed REJECTED: {'; '.join(fatal)}")
+        return []
+    return clean
 
 def tf_state(bars):
     closes = [b[4] for b in bars]
@@ -146,6 +168,7 @@ def db_connect():
         if name not in cols:
             con.execute(f"ALTER TABLE memory ADD COLUMN {name} {typ}")
     con.execute("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)")
+    con.execute(SIGNALS_DDL)
     return con
 
 def load_state(con):
@@ -316,7 +339,7 @@ def analyse_symbol(sym):
                       "vol": 50.0},
             "quality": quality, "momentum": mom, "conf": conf, "mtf_ok": conf >= 3,
             "regime": 1 if (s60["bull"] or s60["bear"]) else 0,
-            "session": session_tag(m15[-1][0]), "price": c,
+            "session": session_tag(m15[-1][0]), "price": c, "bar_ts": m15[-1][0],
             "ind": {"macd": macd_l, "macd_h": macd_h, "bb_up": bb_up, "bb_mid": bb_mid,
                     "bb_low": bb_low, "bb_pos": bb_pos, "vwap": indicators.vwap(m15)},
             "vix": vix_val, "vix_label": vix_label, "vix_off": vix_off}
@@ -376,7 +399,40 @@ def _pending_from(cand, mem, mode, tier="TAKE"):
     p["tier"] = tier
     p["behav"] = mem["behav"]
     p["mode"] = mode
+    # Risk-firewall metadata: when the card was raised and how old the data
+    # behind it was, so a stale card can never be opened later.
+    p["created_at"] = int(time.time())
+    p["bar_ts"] = cand.get("bar_ts")
     return p
+
+
+def signal_id(p):
+    """Stable id for a signal record — same setup pressed twice maps to one row."""
+    return (f"{p.get('symbol')}|{p.get('direction')}|{float(p.get('entry') or 0):.5f}"
+            f"|{int(p.get('created_at') or 0)}")
+
+
+def record_signal(con, p, status, reason=""):
+    """Persist a structured signal record (Phase 5D). Never raises into the engine."""
+    if con is None or not p:
+        return
+    try:
+        now = int(time.time())
+        con.execute(
+            """INSERT INTO signals(signal_id,symbol,direction,tf,entry,sl,tp_r,tier,
+                 quality,momentum,session,regime,status,reason,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(signal_id) DO UPDATE SET
+                 status=excluded.status, reason=excluded.reason, updated_at=excluded.updated_at""",
+            (signal_id(p), str(p.get("symbol")), int(p.get("direction") or 0), str(p.get("tf") or ""),
+             float(p.get("entry") or 0), float(p.get("sl") or 0), float(p.get("tp") or 0),
+             str(p.get("tier") or ""), float(p.get("quality") or 0), float(p.get("momentum") or 0),
+             str(p.get("session") or ""), int(p.get("regime") or 0), str(status), str(reason)[:400],
+             int(p.get("created_at") or now), now),
+        )
+        con.commit()
+    except Exception as e:
+        print(f"[risk] signal record failed: {e}")
 
 
 def aplus_focus_card(state, cand, mem, reason, edge, decision):
@@ -407,6 +463,7 @@ def aplus_focus_card(state, cand, mem, reason, edge, decision):
            f"Reason: {reason} | Edge {edge:.0f}\n"
            f"{warn}If all stop out: ~-{total:.2f}% of account | Slots after: {len(fl) + 1}/2")
     state["pending"] = _pending_from(cand, mem, "aplus", tier)
+    record_signal(con, state["pending"], "pending", f"A+ {reason}")
     if len(fl) >= 2:
         tg_send(txt + "\n\n❌ Slots full (2/2) — /close a trade first if you want this one.",
                 [[{"text": "✖ NOT TAKEN", "callback_data": "T|no"}]])
@@ -471,6 +528,12 @@ def consider_candidates(con, state, analyses):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if state.get("day") != today:
         state["day"], state["daily_r"] = today, 0.0
+        state["day_opens"] = 0
+    # Kill switch: an OFF input halts all new setups (existing trades still managed).
+    ks = risk.kill_active(state)
+    if ks:
+        print(f"[risk] kill switch active ({ks}) — no new setups this scan")
+        return
     if time.time() < state.get("pause_until", 0):
         print("[risk] loss-streak pause active — no new alerts")
         return
@@ -530,6 +593,7 @@ def consider_candidates(con, state, analyses):
     cd[key] = time.time() + config.COOLDOWN_H * 3600
     state["cooldowns"] = cd
     state["pending"] = _pending_from(cand, mem, "normal", "TAKE" if decision == 1 else "RISKY")
+    record_signal(con, state["pending"], "pending", reason)
     print(f"[setup] {cand['symbol']} {decision} alerted ({reason})")
 
 def manage_focus(state, analyses):
@@ -645,6 +709,7 @@ def close_focus(con, state, r_override=None, sym=None):
         tg_send(f"🛑 {config.MAX_LOSS_STREAK} losses in a row — engine paused for {config.PAUSE_SCANS} scans.")
     state["daily_r"] = state.get("daily_r", 0.0) + r
     state["focus_list"] = [x for x in fl if x is not f]
+    record_signal(con, dict(f, tp=f.get("tp_r", 0)), "closed", f"{r:+.2f}R managed")
     # --- OpsHub: record the close in the hub outbox (guarded, never crashes) ---
     try:
         import hub_emit
@@ -654,32 +719,50 @@ def close_focus(con, state, r_override=None, sym=None):
     return f"logged {r:+.2f}R (managed, {f['tier']})"
 
 # ---------------- telegram updates ----------------
-def start_focus_trade(state, p, tier=None):
+def start_focus_trade(state, p, tier=None, con=None):
     if tier:
         p = dict(p)
         p["tier"] = tier
+    # ---- independent risk firewall (risk.py): the single, non-bypassable ----
+    # ---- choke point. OpsHub/AI/agents cannot open without passing this. ----
+    ok, reasons = risk.validate_open(state, p)
+    if not ok:
+        print(f"[risk] BLOCKED {p.get('symbol')}: {'; '.join(reasons)}")
+        tg_send("⛔ <b>RISK BLOCK — no trade opened</b>\n"
+                f"{p.get('symbol', '?')} "
+                f"{'BUY' if p.get('direction') == 1 else 'SELL'}\n• "
+                + "\n• ".join(reasons)
+                + "\nAutomatic pre-trade validation — position NOT taken.")
+        record_signal(con, p, "rejected", "; ".join(reasons))
+        return False
     t = {"symbol": p["symbol"], "tf": p["tf"], "direction": p["direction"],
          "tier": p["tier"], "entry": p["entry"], "sl": p["sl"],
          "risk": abs(p["entry"] - p["sl"]), "tp_r": p["tp"], "feats": p["feats"],
          "quality": p["quality"], "momentum": p["momentum"], "conf": p["conf"],
          "regime": p["regime"], "session": p["session"], "behav": p.get("behav", {}),
          "opened_ts": int(time.time()), "mfe": 0.0, "mae": 0.0,
+         "created_at": p.get("created_at"),
          "peak_r": 0.0, "giveback": 0.0, "bars_held": 0,
          "be_done": False, "reduced": False, "extended": False, "pings": 0}
     fl = state.setdefault("focus_list", [])
     if any(x["symbol"] == t["symbol"] and x["direction"] == t["direction"] for x in fl):
         tg_send(f"Already tracking {config.SYMBOLS[t['symbol']]['name']} that direction — not duplicated.")
-        return
+        record_signal(con, p, "rejected", "duplicate of an open position")
+        return False
     if len(fl) >= 2:
         tg_send("Slots full (2/2) — /close a trade first.")
-        return
+        record_signal(con, p, "rejected", "concurrent slots full (2/2)")
+        return False
     fl.append(t)
+    state["day_opens"] = int(state.get("day_opens", 0)) + 1
+    record_signal(con, p, "opened", f"tier={t['tier']} tf={t['tf']}")
     name = config.SYMBOLS[t["symbol"]]["name"]
     d = "BUY" if t["direction"] == 1 else "SELL"
     tg_send(f"🔒 TRACKING {name} {d} ({t['tier']}) — open trades {len(fl)}/2\n"
             f"Entry {t['entry']:.2f} | SL {t['sl']:.2f} | TP {tp_price_from(t):.2f}\n"
             f"Management = history + momentum.",
             [[{"text": f"🏁 CLOSED — log {t['symbol']}", "callback_data": f"C|close:{t['symbol']}"}]])
+    return True
 
 
 # ---------------- hub button-ack relay ----------------
@@ -734,13 +817,13 @@ def handle_ack(con, state, data):
         if not p:
             tg_send("No pending setup to acknowledge.")
             return
-        start_focus_trade(state, p, "TAKE" if data == "T|take" else "RISKY")
+        start_focus_trade(state, p, "TAKE" if data == "T|take" else "RISKY", con=con)
         state["pending"] = None
     elif data == "T|both":
         if not p or p.get("mode") != "aplus":
             tg_send("No A+ card pending.")
             return
-        start_focus_trade(state, p)
+        start_focus_trade(state, p, con=con)
         state["pending"] = None
     elif data == "T|swap":
         if not p or p.get("mode") not in ("aplus", "REVERSAL"):
@@ -752,14 +835,14 @@ def handle_ack(con, state, data):
             return
         if fl:
             tg_send(f"🏁 {close_focus(con, state, None)}")
-        start_focus_trade(state, p)
+        start_focus_trade(state, p, con=con)
         state["pending"] = None
     elif data == "T|cswap":
         if not p or p.get("mode") != "SWAP":
             tg_send("No swap card pending.")
             return
         tg_send(f"🏁 {close_focus(con, state, None)}")
-        start_focus_trade(state, p)
+        start_focus_trade(state, p, con=con)
         state["pending"] = None
     elif data == "T|tpup":
         if not p or p.get("mode") != "TPUP":
@@ -771,6 +854,8 @@ def handle_ack(con, state, data):
             tg_send(f"✅ TP raised → {tp_price_from(t):.2f} ({t['tp_r']:.2f}R). Entry/risk unchanged — update TP in your broker app.")
         state["pending"] = None
     elif data == "T|no":
+        if p:
+            record_signal(con, p, "dismissed", "NOT TAKEN pressed")
         state["pending"] = None
         tg_send("Noted — not taken. Similar setups stay quiet for the cooldown period.")
     elif data.startswith("C|close"):
@@ -796,8 +881,9 @@ def handle_command(con, state, txt):
                  "entry": entry, "sl": sl, "tp": abs(tp - entry) / max(abs(entry - sl), 1e-9),
                  "feats": {"disp": 0, "cont": 0, "depth": 0, "sweep": 0, "vol": 50},
                  "quality": 50, "momentum": 50, "conf": 2, "regime": 0,
-                 "session": session_tag(time.time()), "behav": {}}
-            start_focus_trade(state, p)
+                 "session": session_tag(time.time()), "behav": {},
+                 "price": entry, "created_at": int(time.time()), "source": "manual"}
+            start_focus_trade(state, p, con=con)
         else:
             tg_send("Format: /taken XAUUSD BUY 2650.5 2645.0 2660.0 RISKY")
     elif txt.startswith("/close"):

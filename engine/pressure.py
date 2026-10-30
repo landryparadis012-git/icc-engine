@@ -162,7 +162,7 @@ def pressure_block(lane, name, dtx, zone, f):
             f"Entry {f['entry']:.2f} | SL {f['sl']:.2f} | TP {f['tp']:.2f}\n"
             f"R:R {rr:.1f}")
 
-def send_unified(con, lane, sym, d, zone, f):
+def send_unified(con, lane, sym, d, zone, f, bar_ts=None):
     """one card: old engine pending first, pressure setup second, same buttons"""
     name = config.SYMBOLS[sym]["name"]
     dtx = "BUY" if d == 1 else "SELL"
@@ -184,7 +184,9 @@ def send_unified(con, lane, sym, d, zone, f):
                                   "depth": min(5.0, zone["strength"]), "sweep": 1 if zone["sweep"] else 0,
                                   "vol": zone.get("volr", 50) or 50},
                         "quality": zone["strength"] * 10, "momentum": 60, "conf": 3,
-                        "regime": 0, "session": engine.session_tag(int(time.time())), "behav": {}}
+                        "regime": 0, "session": engine.session_tag(int(time.time())), "behav": {},
+                        "created_at": int(time.time()), "bar_ts": bar_ts}
+    engine.record_signal(con, state["pending"], "pending", f"PRESSURE-{lane} zone {zone.get('strength', 0):.1f}")
     engine.save_state(con, state)
     engine.tg_send(txt, [[{"text": "✅ TAKEN (TAKE)", "callback_data": "T|take"},
                           {"text": "⚠️ TAKEN (RISKY)", "callback_data": "T|risky"}],
@@ -355,7 +357,7 @@ def scan_symbol(con, sym, st):
                                       "tp": f["tp"], "risk": f["risk"], "partial": False,
                                       "opened_ts": int(time.time()), "mfe": 0.0, "be": False})
                 if not zone["sent"]:
-                    send_unified(con, lane, sym, d, zone, f)
+                    send_unified(con, lane, sym, d, zone, f, bar[0])
                     zone["sent"] = True
                 ss["zones"].remove(zone)
         else:
