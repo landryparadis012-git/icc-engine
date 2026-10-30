@@ -24,6 +24,11 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Fail fast: the risk firewall, config-integrity and open-funnel tests run
+      # before any scan, so a broken guard can never reach production state.
+      - name: Unit + integration tests
+        run: python -m unittest discover -s tests -v
+
       - name: Main engine scan
         run: python engine/engine.py
         env:
