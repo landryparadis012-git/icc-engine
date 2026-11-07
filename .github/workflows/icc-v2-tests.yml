@@ -1,0 +1,23 @@
+name: ICC V2 tests
+
+on:
+  pull_request:
+    paths:
+      - 'v2/**'
+      - '.github/workflows/icc-v2-tests.yml'
+  push:
+    branches: [main, v2-foundation]
+    paths:
+      - 'v2/**'
+      - '.github/workflows/icc-v2-tests.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run ICC V2 unit tests
+        run: PYTHONPATH=v2 python -m unittest discover -s v2/tests -v
