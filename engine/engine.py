@@ -14,6 +14,7 @@ import config
 import data_layer
 import indicators
 import regime
+import news_context
 
 DATA_DIR = "data"
 DB_PATH = os.path.join(DATA_DIR, "memory.db")
@@ -332,6 +333,10 @@ def blend(fallback, learned, w):
         return fallback
     return fallback * (1 - w) + learned * w
 
+def news_context_line(state, symbol):
+    return news_context.format_context(state.get("news_context"), symbol)
+
+
 def send_setup_alert(state, cand, mem, decision, reason, edge, tag=""):
     d = "BUY" if cand["direction"] == 1 else "SELL"
     icon = "🟢" if decision == 1 else "🟠"
@@ -351,7 +356,7 @@ def send_setup_alert(state, cand, mem, decision, reason, edge, tag=""):
            + hist_line +
            f"\nQ {cand['quality']:.0f} | MOM {cand['momentum']:.0f} | MTF {cand['conf']}/4 | {cand['session']} reg={cand['regime']}\n"
            f"VIX {cand.get('vix') or '?'} ({cand.get('vix_label', '?')}) | MACD {'▲' if ind.get('macd_h', 0) >= 0 else '▼'} | BB {ind.get('bb_pos', 50):.0f}%\n"
-           f"Reason: {reason} | Edge {edge:.0f} | v{config.CONFIG_VERSION}")
+           f"Reason: {reason} | Edge {edge:.0f} | v{config.CONFIG_VERSION}" + news_context_line(state, cand["symbol"]))
     tg_send(txt, [[{"text": "✅ TAKEN (TAKE)", "callback_data": "T|take"},
                    {"text": "⚠️ TAKEN (RISKY)", "callback_data": "T|risky"}],
                   [{"text": "✖ NOT TAKEN", "callback_data": "T|no"}]])
@@ -405,7 +410,7 @@ def aplus_focus_card(state, cand, mem, reason, edge, decision):
            + hist_line +
            f"\nQ {cand['quality']:.0f} | MOM {cand['momentum']:.0f} | MTF {cand['conf']}/4\n"
            f"Reason: {reason} | Edge {edge:.0f}\n"
-           f"{warn}If all stop out: ~-{total:.2f}% of account | Slots after: {len(fl) + 1}/2")
+           f"{warn}If all stop out: ~-{total:.2f}% of account | Slots after: {len(fl) + 1}/2" + news_context_line(state, cand["symbol"]))
     state["pending"] = _pending_from(cand, mem, "aplus", tier)
     if len(fl) >= 2:
         tg_send(txt + "\n\n❌ Slots full (2/2) — /close a trade first if you want this one.",
@@ -458,7 +463,7 @@ def same_symbol_card(state, cand, mem, an):
         txt = (f"⚠️ {name} {od} LOST MOMENTUM\n"
                f"Open R: {r:+.2f} | momentum {mom:.0f}\n"
                f"New setup: quality {cand['quality']:.0f} | direction {d}\n"
-               f"Decision: CLOSE CURRENT & SWAP")
+               f"Decision: CLOSE CURRENT & SWAP" + news_context_line(state, cand["symbol"]))
         state["pending"] = _pending_from(cand, mem, "SWAP")
         tg_send(txt, [[{"text": "🔁 CLOSE & SWAP", "callback_data": "T|cswap"},
                        {"text": "✖ KEEP CURRENT", "callback_data": "T|no"}]])
@@ -471,11 +476,26 @@ def consider_candidates(con, state, analyses):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if state.get("day") != today:
         state["day"], state["daily_r"] = today, 0.0
+    guards = state.get("news_guards", {})
+    active_guards = [g for g in guards.values() if time.time() < g.get("block_until", 0)]
+    if active_guards:
+        guard = max(active_guards, key=lambda g: g.get("block_until", 0))
+        print(f"[news] blackout active for {len(active_guards)} high-impact event(s)")
+        if not guard.get("notice_sent"):
+            tg_send(f"📰 NEWS BLACKOUT — {guard['currency']} · {guard['event']}\nNew ICC entries paused until 90 seconds after this release. Existing positions continue to be managed.")
+            guard["notice_sent"] = True
+        return
     if time.time() < state.get("pause_until", 0):
         print("[risk] loss-streak pause active — no new alerts")
+        if state.get("news_context"):
+            ctx = state["news_context"]
+            tg_send(f"📰 POST-NEWS CHECK — {ctx['currency']} · {ctx['event']}\nNo trade: ICC loss-streak pause is active. Risk protection was not bypassed.")
         return
     if state.get("daily_r", 0.0) <= config.DAILY_LOSS_R:
         print("[risk] daily loss limit hit — no new alerts today")
+        if state.get("news_context"):
+            ctx = state["news_context"]
+            tg_send(f"📰 POST-NEWS CHECK — {ctx['currency']} · {ctx['event']}\nNo trade: ICC daily loss limit is active. Risk protection was not bypassed.")
         return
     cands = []
     for sym, an in analyses.items():
@@ -483,13 +503,22 @@ def consider_candidates(con, state, analyses):
             mem = match_memory(con, an["candidate"])
             an["candidate"]["tp"] = mem["tp"]
             cands.append((an["candidate"], mem))
+    ctx = state.get("news_context")
+    if ctx:
+        cands = [cm for cm in cands if news_context.is_relevant(ctx, cm[0]["symbol"])]
     if not cands:
+        if ctx:
+            tg_send(f"📰 POST-NEWS CHECK — {ctx['currency']} · {ctx['event']}\nNo relevant instrument produced a qualifying ICC technical setup on this scan. No trade was triggered; the engine will wait for its normal structure, memory and risk conditions.")
         return
     focus_list = state.get("focus_list", [])
     ranked = sorted(cands, key=lambda cm: (cm[1]["exp"] if cm[1]["count"] > 0 else -9.0, cm[0]["quality"]), reverse=True)
     cand, mem = ranked[0]
     key = f"{cand['symbol']}|{cand['direction']}"
     if time.time() < state.get("cooldowns", {}).get(key, 0):
+        if state.get("news_context"):
+            ctx = state["news_context"]
+            direction = "BUY" if cand["direction"] == 1 else "SELL"
+            tg_send(f"📰 POST-NEWS CHECK — {ctx['currency']} · {ctx['event']}\n{cand['symbol']} {direction} was suppressed by its existing setup cooldown. No duplicate trade alert.")
         return
     decision, reason, edge = decide(cand, mem)
     # VIX stress gate: rescue-tier entries are blocked when volatility says risk-off
@@ -509,6 +538,9 @@ def consider_candidates(con, state, analyses):
             state.setdefault("cooldowns", {})[key] = time.time() + config.COOLDOWN_H * 3600
             return
         if decision != 3:
+            if state.get("news_context"):
+                ctx = state["news_context"]
+                tg_send(f"📰 POST-NEWS CHECK — {ctx['currency']} · {ctx['event']}\nA relevant candidate was found, but it did not qualify for an A+ action while another focus trade is open. Existing trade management takes priority.")
             return
     if decision == 3:
         rp = dict(cand)
@@ -524,6 +556,9 @@ def consider_candidates(con, state, analyses):
         state.setdefault("replays", []).append(rp)
         state["replays"] = state["replays"][-50:]
         print(f"[setup] {cand['symbol']} SKIP ({reason}) — queued for raw replay")
+        if state.get("news_context"):
+            ctx = state["news_context"]
+            tg_send(f"📰 POST-NEWS CHECK — {ctx['currency']} · {ctx['event']}\n{cand['symbol']} was filtered by ICC: {reason}. No trade was triggered.")
         return
     send_setup_alert(state, cand, mem, decision, reason, edge)
     cd = state.get("cooldowns", {})
@@ -895,6 +930,21 @@ def main():
     if not isinstance(state.get("focus_list"), list):
         old = state.pop("focus", None)
         state["focus_list"] = [old] if old else []
+    news_event = news_context.load_github_event(os.environ.get("GITHUB_EVENT_PATH"))
+    guards = state.setdefault("news_guards", {})
+    if news_event and news_event.get("kind") == "guard":
+        guards[news_event["key"]] = news_event
+        print(f"[news] pre-release blackout loaded: {news_event['currency']} {news_event['event']}")
+    elif news_event and news_event.get("kind") == "post":
+        state["news_context"] = news_event
+        print(f"[news] post-release context loaded: {news_event['currency']} {news_event['event']}")
+    else:
+        state.pop("news_context", None)
+    now_s = int(time.time())
+    state["news_guards"] = {
+        key: guard for key, guard in guards.items()
+        if guard.get("block_until", 0) > now_s
+    }
     n = con.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
     print(f"[icc] engine {config.CONFIG_VERSION} | memory rows: {n}")
     process_updates(con, state)

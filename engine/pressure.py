@@ -174,6 +174,9 @@ def send_unified(con, lane, sym, d, zone, f):
     else:
         blocks.append("<i>1️⃣ ICC ENGINE — no setup this scan</i>")
     blocks.append(pressure_block(lane, name, dtx, zone, f))
+    news_line = engine.news_context.format_context(state.get("news_context"), sym)
+    if news_line:
+        blocks.append(news_line.strip())
     txt = "═══ SETUP CARD ═══\n" + "\n\n".join(blocks) + \
           "\n\n⚠️ Taking the pressure setup REPLACES the old-engine pending (last card wins)."
     # promote the pressure setup into the old engine's pending slot → same buttons, same management

@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
   # OpsHub triggers this repo with a repository_dispatch (type: icc.run).
   repository_dispatch:
-    types: [icc.run, opshub.run]
+    types: [icc.run, icc.news_guard, opshub.run]
 
 permissions:
   contents: write
